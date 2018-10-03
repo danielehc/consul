@@ -5,18 +5,22 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
+	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	proxyAgent "github.com/hashicorp/consul/agent/proxyprocess"
 	"github.com/hashicorp/consul/agent/xds"
 	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/command/connect/envoy/fdutil"
 	proxyCmd "github.com/hashicorp/consul/command/connect/proxy"
 	"github.com/hashicorp/consul/command/flags"
+	"golang.org/x/sys/unix"
 
 	"github.com/mitchellh/cli"
 )
@@ -72,7 +76,7 @@ func (c *cmd) init() {
 			"as it has full control over the secrets and config of the proxy.")
 
 	c.flags.BoolVar(&c.bootstrap, "bootstrap", false,
-		"Generate the bootstrap.yaml but don't exec envoy")
+		"Generate the bootstrap.json but don't exec envoy")
 
 	c.flags.StringVar(&c.grpcAddr, "grpc-addr", "",
 		"Set the agent's gRPC address and port (in http(s)://host:port format). "+
@@ -135,7 +139,7 @@ func (c *cmd) Run(args []string) int {
 	}
 
 	// Generate config
-	bootstrapYaml, err := c.generateConfig()
+	bootstrapJson, err := c.generateConfig()
 	if err != nil {
 		c.UI.Error(err.Error())
 		return 1
@@ -143,7 +147,7 @@ func (c *cmd) Run(args []string) int {
 
 	if c.bootstrap {
 		// Just output it and we are done
-		fmt.Println(bootstrapYaml)
+		os.Stdout.Write(bootstrapJson)
 		return 0
 	}
 
@@ -154,24 +158,72 @@ func (c *cmd) Run(args []string) int {
 		return 1
 	}
 
-	// First argument needs to be the executable name.
+	// Write the Envoy bootstrap config file out to disk in a pocket universe
+	// visible only to the current process (and exec'd future selves).
+	fd, err := writeEphemeralEnvoyTempFile(bootstrapJson)
+	if err != nil {
+		c.UI.Error("Could not write envoy bootstrap config to a temp file: " + err.Error())
+		return 1
+	}
 
-	// TODO(banks): passing config including an ACL token on command line is jank
-	// - this is world readable. It's easiest thing for now. Temp files are kinda
-	// gross in a different way - we can limit to same-user access which is much
-	// better but we are leaving the ACL secret on disk unencrypted for an
-	// uncontrolled amount of time and in a location the operator doesn't even
-	// know about. Envoy doesn't support reading bootstrap from stdin or ENV
-	envoyArgs := []string{binary, "--config-yaml", bootstrapYaml}
+	// On unix systems after exec the file descriptors that we should see:
+	//
+	//   0: stdin
+	//   1: stdout
+	//   2: stderr
+	//   ... any open file descriptors from the parent without CLOEXEC set
+	//
+	// Above we explicitly disabled CLOEXEC for our temp file, so assuming
+	// FD numbers survive across execs, it should just be the value of
+	// `fd`. This is accessible as a file itself (trippy!) under
+	// /dev/fd/$FDNUMBER.
+	magicPath := filepath.Join("/dev/fd", strconv.Itoa(int(fd)))
+
+	// First argument needs to be the executable name.
+	envoyArgs := []string{binary, "--v2-config-only", "--config-path", magicPath}
 	envoyArgs = append(envoyArgs, passThroughArgs...)
 
 	// Exec
-	err = syscall.Exec(binary, envoyArgs, os.Environ())
+	err = unix.Exec(binary, envoyArgs, os.Environ())
 	if err != nil {
 		c.UI.Error("Failed to exec envoy: " + err.Error())
 		return 1
 	}
+
 	return 0
+}
+
+func writeEphemeralEnvoyTempFile(b []byte) (uintptr, error) {
+	f, err := ioutil.TempFile("", "envoy-ephemeral-config")
+	if err != nil {
+		return 0, err
+	}
+
+	errFn := func(err error) (uintptr, error) {
+		_ = f.Close()
+		return 0, err
+	}
+
+	// Immediately unlink the file as we are going to just pass the
+	// file descriptor, not the path.
+	if err = os.Remove(f.Name()); err != nil {
+		return errFn(err)
+	}
+	if _, err = f.Write(b); err != nil {
+		return errFn(err)
+	}
+	// Rewind the file descriptor so Envoy can read it.
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		return errFn(err)
+	}
+
+	// Disable CLOEXEC so that this file descriptor is available
+	// to the exec'd Envoy.
+	if err := fdutil.SetCloseOnExec(f.Fd(), false); err != nil {
+		return errFn(err)
+	}
+
+	return f.Fd(), nil
 }
 
 func (c *cmd) findBinary() (string, error) {
@@ -183,7 +235,7 @@ func (c *cmd) findBinary() (string, error) {
 
 // TODO(banks) this method ended up with a few subtleties that should be unit
 // tested.
-func (c *cmd) generateConfig() (string, error) {
+func (c *cmd) generateConfig() ([]byte, error) {
 	var t = template.Must(template.New("bootstrap").Parse(bootstrapTemplate))
 
 	httpCfg := api.DefaultConfig()
@@ -212,7 +264,7 @@ func (c *cmd) generateConfig() (string, error) {
 
 	agentAddr, agentPort, err := net.SplitHostPort(addrPort)
 	if err != nil {
-		return "", fmt.Errorf("Invalid Consul HTTP address: %s", err)
+		return nil, fmt.Errorf("Invalid Consul HTTP address: %s", err)
 	}
 	if agentAddr == "" {
 		agentAddr = "127.0.0.1"
@@ -226,19 +278,19 @@ func (c *cmd) generateConfig() (string, error) {
 	// can't connect.
 	agentIP, err := net.ResolveIPAddr("ip", agentAddr)
 	if err != nil {
-		return "", fmt.Errorf("Failed to resolve agent address: %s", err)
+		return nil, fmt.Errorf("Failed to resolve agent address: %s", err)
 	}
 
 	adminAddr, adminPort, err := net.SplitHostPort(c.adminBind)
 	if err != nil {
-		return "", fmt.Errorf("Invalid Consul HTTP address: %s", err)
+		return nil, fmt.Errorf("Invalid Consul HTTP address: %s", err)
 	}
 
 	// Envoy requires IP addresses to bind too when using static so resolve DNS or
 	// localhost here.
 	adminBindIP, err := net.ResolveIPAddr("ip", adminAddr)
 	if err != nil {
-		return "", fmt.Errorf("Failed to resolve admin bind address: %s", err)
+		return nil, fmt.Errorf("Failed to resolve admin bind address: %s", err)
 	}
 
 	args := templateArgs{
@@ -257,9 +309,9 @@ func (c *cmd) generateConfig() (string, error) {
 	var buf bytes.Buffer
 	err = t.Execute(&buf, args)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return buf.String(), nil
+	return buf.Bytes(), nil
 }
 
 func (c *cmd) lookupProxyIDForSidecar() (string, error) {
@@ -285,7 +337,7 @@ Usage: consul connect envoy [options]
   It will search $PATH for the envoy binary but this can be overridden with
   -envoy-binary.
 
-  It can instead only generate the bootstrap.yaml based on the current ENV and
+  It can instead only generate the bootstrap.json based on the current ENV and
   arguments using -bootstrap.
 
   The proxy requires service:write permissions for the service it represents.
