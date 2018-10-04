@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -46,7 +45,7 @@ func execEnvoy(binary string, passThroughArgs []string, bootstrapJson []byte) er
 	envoyArgs = append(envoyArgs, passThroughArgs...)
 
 	// Exec
-	if err = syscall.Exec(binary, envoyArgs, os.Environ()); err != nil {
+	if err = unix.Exec(binary, envoyArgs, os.Environ()); err != nil {
 		return errors.New("Failed to exec envoy: " + err.Error())
 	}
 
