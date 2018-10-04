@@ -2,25 +2,21 @@ package envoy
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
-	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 
 	proxyAgent "github.com/hashicorp/consul/agent/proxyprocess"
 	"github.com/hashicorp/consul/agent/xds"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/command/connect/envoy/fdutil"
 	proxyCmd "github.com/hashicorp/consul/command/connect/proxy"
 	"github.com/hashicorp/consul/command/flags"
-	"golang.org/x/sys/unix"
 
 	"github.com/mitchellh/cli"
 )
@@ -158,73 +154,22 @@ func (c *cmd) Run(args []string) int {
 		return 1
 	}
 
-	// Write the Envoy bootstrap config file out to disk in a pocket universe
-	// visible only to the current process (and exec'd future selves).
-	fd, err := writeEphemeralEnvoyTempFile(bootstrapJson)
-	if err != nil {
-		c.UI.Error("Could not write envoy bootstrap config to a temp file: " + err.Error())
+	err = execEnvoy(binary, passThroughArgs, bootstrapJson)
+	if err == errUnsupportedOS {
+		c.UI.Error("directly running Envoy is only supported on linux and macOS " +
+			"since envoy itself doesn't build on other platforms currently. Use " +
+			"the -bootstrap option to generate the JSON to use when running envoy " +
+			"on a supported OS or via a container or VM.")
 		return 1
-	}
-
-	// On unix systems after exec the file descriptors that we should see:
-	//
-	//   0: stdin
-	//   1: stdout
-	//   2: stderr
-	//   ... any open file descriptors from the parent without CLOEXEC set
-	//
-	// Above we explicitly disabled CLOEXEC for our temp file, so assuming
-	// FD numbers survive across execs, it should just be the value of
-	// `fd`. This is accessible as a file itself (trippy!) under
-	// /dev/fd/$FDNUMBER.
-	magicPath := filepath.Join("/dev/fd", strconv.Itoa(int(fd)))
-
-	// First argument needs to be the executable name.
-	envoyArgs := []string{binary, "--v2-config-only", "--config-path", magicPath}
-	envoyArgs = append(envoyArgs, passThroughArgs...)
-
-	// Exec
-	err = unix.Exec(binary, envoyArgs, os.Environ())
-	if err != nil {
-		c.UI.Error("Failed to exec envoy: " + err.Error())
+	} else if err != nil {
+		c.UI.Error(err.Error())
 		return 1
 	}
 
 	return 0
 }
 
-func writeEphemeralEnvoyTempFile(b []byte) (uintptr, error) {
-	f, err := ioutil.TempFile("", "envoy-ephemeral-config")
-	if err != nil {
-		return 0, err
-	}
-
-	errFn := func(err error) (uintptr, error) {
-		_ = f.Close()
-		return 0, err
-	}
-
-	// Immediately unlink the file as we are going to just pass the
-	// file descriptor, not the path.
-	if err = os.Remove(f.Name()); err != nil {
-		return errFn(err)
-	}
-	if _, err = f.Write(b); err != nil {
-		return errFn(err)
-	}
-	// Rewind the file descriptor so Envoy can read it.
-	if _, err = f.Seek(0, io.SeekStart); err != nil {
-		return errFn(err)
-	}
-
-	// Disable CLOEXEC so that this file descriptor is available
-	// to the exec'd Envoy.
-	if err := fdutil.SetCloseOnExec(f.Fd(), false); err != nil {
-		return errFn(err)
-	}
-
-	return f.Fd(), nil
-}
+var errUnsupportedOS = errors.New("envoy: not implemented on this operating system")
 
 func (c *cmd) findBinary() (string, error) {
 	if c.envoyBin != "" {
